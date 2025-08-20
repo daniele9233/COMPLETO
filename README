@@ -1,3 +1,182 @@
+Sommario
+
+Scopo del progetto (alta livello)
+
+Inventario e variabili globali (group_vars)
+
+Flusso di esecuzione (playbook principali) + diagramma (Mermaid)
+
+Ruoli — descrizione e cosa fa ogni ruolo
+
+Task dettagliati per i ruoli più importanti (condizioni ed effetti)
+
+Dipendenze tra ruoli (meta / osservazioni)
+
+Mappatura tag → ruoli / task principali (se presenti)
+
+Integrazioni esterne (DB, API, Helm repo, registri YUM/APT, NFS, Rancher API)
+
+Esecuzione sicura: comandi di esempio e checklist pre-run
+
+Note su file mancanti o da revisionare
+
+1) Scopo del progetto (alto livello)
+
+Questo repository automatizza l’installazione e la configurazione di un’infrastruttura Kubernetes basata su RKE2 + Rancher, costruisce il cluster, configura NFS (server e client e provisioner), installa Rancher tramite Helm (con certificati), deploya servizi addizionali in-cluster (pgAdmin, Prometheus/Grafana) e installa/configura un reverse-proxy Nginx per esporre i servizi. La sequenza di playbook copre: preparazione dischi, aggiornamento /etc/hosts, installazione master RKE2, creazione cluster via Rancher API, join dei manager/workers, setup kubectl, NFS, provisioning storage per k8s e stack di monitoring.
+
+2) Inventario & variabili globali
+
+Il file inventory.ini contiene gruppi: masters, new_managers, workers, nfs_server, nginx_servers, local. (Esempio IP/host trovati nel file). 
+
+group_vars/all.yml definisce variabili globali: rancher_domain, password bootstrap, versioni Helm/Rancher, parametri LVM (vg_name, lv_name), percorsi certificati, configurazione NFS (export_dir, nfs_clients), storage class name, configurazione Prometheus/Grafana, ecc. Queste variabili vengono usate da molti ruoli.
+
+
+3) Flusso di esecuzione (playbook principali)
+
+Playbook principale: site.yml (e versioni singole in playbook-singoli/) definisce la sequenza:
+
+create_disk su hosts: all (prepara LVM/mount per Rancher). 
+
+update_hosts_file su tutti (aggiorna /etc/hosts per rancher_domain). 
+
+Su masters: master1_install, master1_config, master1_kubectl, master1_helm_cert_manager_install → install RKE2, scrivere config, copiare kubectl e installare Rancher con Helm + creare i segreti TLS.
+
+master1_create_cluster su masters → usa Rancher API per creare il cluster, creare token di registrazione, e lancia comandi system-agent per fare join dei manager e worker. 
+
+Pause temporizzate (pause tasks) per lasciare il tempo ai servizi di inizializzare. 
+
+kubectl_setup sui new_managers (copia kubeconfig, patch per cattle-cluster-agent hostAliases). 
+
+NFS server install (nfs role) + configurazione client (nfs_client_setup) + install nfs_provisioner in-cluster per creare StorageClass.
+
+Deploy di applicazioni: install_pgadmin (crea namespace, deployment, PVC) e install_prometheus (Helm install del kube-prometheus-stack).
+
+nginx_install su nginx_servers per esporre/instradare il traffico ai backend (Rancher + multi-servizi).
+
+4) Ruoli — cosa fanno (sintesi)
+
+Per ciascun ruolo ho estratto cosa fa e i file di task principali.
+
+create_disk
+
+Cerca un disco non usato (usa lsblk) e, se trovato, crea partizione, PV, VG, LV, formatta e monta in rancher_mount_point (LVM). Se non trova disco, esegue uno skip. Condizioni: esegue LVM solo se trova un disco libero. Effetti: /etc/fstab aggiornato e mount eseguito. 
+
+update_hosts_file
+
+Rimuove vecchi entry del dominio rancher_domain e aggiunge la riga corretta in /etc/hosts basata sull’IP del primo master (groups['masters'][0]). Verifiche: nslookup / ping (ignorando errori). Run-once per determinati set_fact. 
+
+master1_install
+
+Installa RKE2 tramite curl | sh, abilita e avvia rke2-server. Effetto: servizio RKE2 in esecuzione sul master. 
+
+master1_config
+
+Crea /etc/rancher/rke2/config.yaml con tls-san impostato al rancher_domain. Impatto: configura RKE2 per TLS SAN. 
+
+master1_kubectl
+
+Copia kubectl e kubeconfig da /etc/rancher/rke2/rke2.yaml a /root/.kube/config. Effetto: abilita comandi kubectl locali. 
+
+master1_helm_cert_manager_install
+
+Installa Helm (download/untar), copia kubeconfig, crea segreti TLS da certificati locali (fullchain.pem, privkey.pem, cacerts.pem), aggiunge repo rancher-stable e installa Rancher tramite Helm con valori hostname e bootstrap password. Poi aspetta i pod Rancher. Nota: validate_certs: no è usato nelle chiamate API in altri ruoli. Effetti importanti: crea ingress/tls per Rancher. 
+
+master1_create_cluster
+
+Usa le API di Rancher per: login, impostare server-url, creare cluster provisioning (POST a /v1/provisioning...), ottenere token di registration, e lancia su altri host lo script system-agent-install.sh (via curl a Rancher host) per fare join dei manager/worker. Gestisce il polling e visualizza stati. Effetti critici: crea il cluster tramite Rancher e fa join dei nodi. (Molto dipendente dal fatto che Rancher sia pronto). 
+
+kubectl_setup
+
+Copia kubectl e kubeconfig, verifica existence di cattle-system e cattle-cluster-agent, applica una patch per aggiungere hostAliases per il dominio Rancher (fix DNS locale), aspetta rollout ecc. Utile dopo che node si sono registrati in Rancher. 
+
+nfs (server)
+
+Wrapper che include task differenti in base a ansible_os_family e nfs_mode (single/cluster). I task per Debian/Ubuntu installano pacchetti nfs-kernel-server e generano /etc/exports; per RedHat usa nfs-utils e exports via blockinfile. Notifica handler export fs. Condizioni: seleziona file di tasks con when.
+
+nfs_client_setup
+
+(file snippets trovati) Installa nfs client utilities (apt/dnf/zypper) e fa test showmount -e verso nfs_server, mostra warning se non raggiungibile. Include logica di retry per apt se ci sono repository problematici. Effetto: verifica reachability e prepara i nodi per montare export. 
+
+nfs_provisioner
+
+Installa Helm (se mancante), genera values file per nfs-subdir-external-provisioner, esegue helm upgrade --install per rilasciare il provisioner in namespace specificato e attende rollout. Crea (suggerisce) StorageClass. Effetto: in-cluster provisioner che consente PVC su NFS. 
+
+install_prometheus
+
+Crea namespace monitoring, aggiunge repo Helm (prometheus-community), produce file values da template e installa/aggiorna kube-prometheus-stack (helm). In seguito crea ingress (grafana/prometheus) se abilitato. Raccoglie e mostra stato di pods/svc/pvc. Condizioni: gestisce install vs upgrade in base a helm list e values changed.
+
+install_pgadmin
+
+Controlla che kubeconfig esista, crea manifests (namespace, deployment, service, PVC) tramite template e li applica (kubectl apply). Fa rollout status e fallisce se non pronto. PersistentVolumeClaim richiede pgadmin_storage_class. 
+
+nginx_install
+
+Installa nginx (apt), copia certificati, prepara directory conf.d e conf-http.d, backup di nginx.conf, scrive template di upstream/server block (reverse proxy per Rancher e multi-servizi). Notifica restart. Effetti: espone Rancher e altri servizi via HTTPS. 
+
+5) Task dettagliati (esempi approfonditi)
+
+Di seguito alcuni task critici con condizioni, effetti e punti di attenzione. (Per motivi di spazio ho selezionato i task più importanti; posso generare una pagina completa con ogni singolo task se desideri.)
+
+create_disk (estratto)
+
+setup: gather_subset: hardware — eseguito solo se ansible_devices is not defined.
+
+Individua root_device via findmnt.
+
+Shell che scorre lsblk per trovare il primo device non root, senza partizioni e non montato → imposta selected_disk.
+
+Se selected_disk presente: crea partition con parted, pvcreate, vgcreate, lvcreate, formatta (fs_type da group_vars), aggiorna /etc/fstab con UUID e monta.
+
+Se non viene trovato disco, scrive debug e skippa le attività LVM (safe).
+
+Effetti collaterali: modifica LVM e /etc/fstab — attenzione al run su host di produzione senza backup: raccomando --check e test su macchina non critica prima. 
+
+master1_create_cluster (estratto)
+
+Usa delegate_to: "{{ ansibleSshHost }}" per chiamare API Rancher dal controllo centrale; effettua login per ottenere token (/v3-public/localProviders/local?action=login) con username: admin e password: {{ rancher_password }}.
+
+Crea un oggetto provisioning.cattle.io.cluster via POST. Attende la condizione cluster_status.json.status.conditions con retries.
+
+Ottiene clusterregistrationtokens e aspetta che nodeCommand sia presente.
+
+Estrae cluster_token parsando nodeCommand (regex su --token).
+
+Esegue su ciascun nodo target (loop su groups new_managers / workers) un curl a https://{{ rancher_host }}/system-agent-install.sh | sh -s - ... con flag --etcd --controlplane o --worker. Esegue tali comandi in background (async, poll:0) e poi utilizza async_status per attendere completamento.
+
+Rischi e punti di attenzione: l’automazione presuppone che Rancher sia completamente operativo e che i certificati/hostnames risolvano; se qualcosa fallisce, il token o il nodeCommand possono non essere pronti → la play contiene retries e ignore_errors in molti punti. 
+
+nfs (estratto)
+
+Usa include_tasks basati su ansible_os_family e nfs_mode. Questo rende il ruolo adattabile a distribuzioni diverse. Per Debian/Ubuntu esegue install apt dei pacchetti e genera /etc/exports via template, imposta owner directory su nogroup/nobody. Per RedHat installa nfs-utils e crea eksport con blockinfile. Notifica handler export fs. Verificare sempre che nfs_clients contenga gli IP corretti.
+
+nfs_provisioner (estratto)
+
+Controlla KUBECONFIG (kubeconfig su /root/.kube/config) — fail se non esiste. Installa helm CLI se mancante, genera un values.yaml temporaneo con nfs.server e nfs.path e lancia helm upgrade --install per nfs-subdir-external-provisioner. Attende rollout e stampa stato. Effetto: crea StorageClass e provisioner per PVC su NFS. 
+
+6) Dipendenze tra ruoli (meta / osservazioni)
+
+Non ho trovato file roles/*/meta/main.yml che elencino dipendenze dirette dei ruoli (non è presente o non è stato rilevato nei frammenti). Quindi la dipendenza è implicita nel playbook site.yml (ordine di esecuzione) piuttosto che dichiarata come role dependencies. Raccomandazione: aggiungere meta/main.yml per i ruoli che dipendono da altri (es. install_pgadmin dipende da kubectl_setup) per maggiore chiarezza. (Se vuoi, posso generare i meta/main.yml suggeriti). 
+
+7) Mappa tag → ruoli / task principali
+
+Nel repository analizzato non ho trovato un uso estensivo di tags: nei playbook o nei task principali (nessun mapping esplicito tag→task rilevato nei frammenti analizzati). Quindi:
+
+Non ci sono tag centrali da usare per eseguire solo parti specifiche.
+
+Raccomandazione: aggiungere tag strutturali ai play e ai ruoli (es. tag: create_disk, tag: rancher_install, tag: nfs, tag: monitoring, tag: pgadmin) per poter eseguire selettivamente.
+Se vuoi, posso: (A) produrre una lista di tag raccomandati e (B) applicare patch ai playbook per aggiungerli. 
+
+8) Integrazioni esterne e servizi usati
+
+Rancher API (v3/v1 provisioning) — utilizzata per creare cluster e ottenere token. Richiede admin bootstrap password presente in group_vars/all.yml. Attenzione alla sicurezza: password in chiaro.
+
+Helm repositories: rancher-stable e prometheus-community (URL: https://prometheus-community.github.io/helm-charts) usati per installare Rancher chart e kube-prometheus-stack.
+
+NFS: ruolo server + client + nfs-subdir-external-provisioner per PVC dinamici. export_dir e nfs_clients definiti in group_vars.
+
+Certificati locali: i certificati (fullchain.pem, privkey.pem, cacerts.pem) vengono copiati e usati per creare TLS secret per Rancher. Attenzione alla gestione permessi/rotazione. 
+
+APT/YUM: i ruoli usano apt, dnf, zypper a seconda di OS family (con logica di retry per apt in presenza di repo problematici).
 
 
 Step1:  Eseguire questi comandi per capire quali versione di rancher è compatibile con rke2 cosi da poter popolare le variabili
@@ -22,6 +201,14 @@ cacerts.pem
 fullchain.pem
 privkey.pem
 
+
+Esecuzioni consigliate (esempi)
+
+# Verifica completa con diff delle modifiche
+ansible-playbook -i inventory.ini site.yml --check --diff
+
+# Verifica solo sintassi
+ansible-playbook -i inventory.ini site.yml --syntax-check
 
 PRODECURA DI INSTALLAZIONE 
 
