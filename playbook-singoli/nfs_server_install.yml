@@ -1,0 +1,11 @@
+- hosts: nfs_server
+  roles:
+    - role: nfs
+      vars:
+        nfs_mode: single
+        nfs_clients:
+          - "{{IPClientNFS1}}"
+          - "{{IPClientNFS2}}"
+          - "{{IPClientNFS3}}"
+          - "{{IPClientNFS4}}"
+

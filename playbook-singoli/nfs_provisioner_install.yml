@@ -1,0 +1,19 @@
+---
+- name: Install NFS client prerequisites on all cluster nodes
+  hosts: masters:new_managers:workers  # Tutti i nodi del cluster
+  become: true
+  vars:
+    nfs_server: "10.116.82.136"
+  roles:
+    - role: nfs_client_setup
+
+- name: Install NFS Subdir External Provisioner
+  hosts: new_managers
+  become: true
+  vars:
+    nfs_server: "10.116.82.136"
+    nfs_exports:
+      - "/share/k8s"
+      - "/share/backup"
+  roles:
+    - role: nfs_provisioner

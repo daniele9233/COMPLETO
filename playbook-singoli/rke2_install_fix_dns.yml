@@ -1,0 +1,6 @@
+---
+- hosts: new_managers
+  become: yes
+  gather_facts: no
+  roles:
+    - kubectl_setup

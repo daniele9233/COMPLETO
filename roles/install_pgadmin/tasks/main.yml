@@ -1,0 +1,70 @@
+---
+- name: Ensure /root/.kube/config exists (fail early if not)
+  stat:
+    path: /root/.kube/config
+  register: kubeconf
+
+- name: Fail if kubeconfig not found (kubectl must be configured on target host)
+  fail:
+    msg: "/root/.kube/config not present on target host. Run kubectl_setup role first."
+  when: not kubeconf.stat.exists
+
+- name: Set KUBECONFIG environment for kubectl interactions
+  set_fact:
+    _kube_env: { 'KUBECONFIG': '/root/.kube/config' }
+
+- name: Check that storageclass exists (warning only)
+  command: kubectl get sc {{ pgadmin_storage_class }}
+  environment: "{{ _kube_env }}"
+  register: sc_check
+  ignore_errors: yes
+
+- name: Warn if storageclass not found
+  debug:
+    msg: "StorageClass {{ pgadmin_storage_class }} not found on cluster — il PVC potrebbe non essere soddisfatto."
+  when: sc_check.rc != 0
+
+- name: Ensure temporary manifest directory
+  file:
+    path: /tmp/pgadmin_manifests
+    state: directory
+    mode: '0755'
+
+- name: Create pgAdmin namespace manifest
+  copy:
+    dest: /tmp/pgadmin_manifests/pgadmin-namespace.yaml
+    content: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: {{ pgadmin_namespace }}
+
+- name: Apply pgAdmin namespace
+  command: kubectl apply -f /tmp/pgadmin_manifests/pgadmin-namespace.yaml
+  environment: "{{ _kube_env }}"
+
+- name: Render pgAdmin Deployment manifest
+  template:
+    src: pgadmin-deployment.yaml.j2
+    dest: /tmp/pgadmin_manifests/pgadmin-deployment.yaml
+
+- name: Render pgAdmin Service manifest
+  template:
+    src: pgadmin-service.yaml.j2
+    dest: /tmp/pgadmin_manifests/pgadmin-service.yaml
+
+- name: Render pgAdmin Ingress manifest
+  template:
+    src: pgadmin-ingress.yaml.j2
+    dest: /tmp/pgadmin_manifests/pgadmin-ingress.yaml
+
+- name: Apply pgAdmin manifests
+  command: kubectl apply -f /tmp/pgadmin_manifests
+  environment: "{{ _kube_env }}"
+
+- name: Wait for pgAdmin deployment rollout
+  command: kubectl -n {{ pgadmin_namespace }} rollout status deploy/pgadmin --timeout={{ pgadmin_rollout_timeout }}
+  environment: "{{ _kube_env }}"
+  register: rollout
+  failed_when: rollout.rc != 0
+

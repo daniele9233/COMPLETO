@@ -1,0 +1,12 @@
+- hosts: new_managers
+  become: yes
+  gather_facts: no
+  roles:
+    - role: kubectl_setup        # se non l'hai già eseguito
+    - role: install_pgadmin
+      vars:
+        pgadmin_hostname: pgadmin.app.iac-svil.almaviva.it
+        pgadmin_username: admin@example.local
+        pgadmin_password: "Cambiami123!"
+        pgadmin_storage_class: nfs-k8s
+

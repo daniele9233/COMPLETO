@@ -1,0 +1,33 @@
+# PAUSA prima dell'installazione Prometheus
+- name: "Pausa prima installazione Prometheus"
+  hosts: localhost
+  gather_facts: no
+  tasks:
+
+# UNDICESIMO PLAY: Install Prometheus Stack
+- name: Install Prometheus Monitoring Stack
+  hosts: new_managers
+  become: yes
+  gather_facts: no
+  vars_files:
+    - group_vars/all.yml
+  roles:
+    - role: install_prometheus
+  post_tasks:
+    - name: Display Prometheus access information
+      debug:
+        msg:
+          - "Prometheus Stack installato con successo!"
+          - "Per configurare l'accesso esterno, aggiungi questi upstream al tuo Nginx:"
+          - ""
+          - "upstream prometheus_backend {"
+          - "    server {{ ansible_host }}:30090 max_fails=3 fail_timeout=5s;"
+          - "}"
+          - ""
+          - "upstream grafana_backend {"
+          - "    server {{ ansible_host }}:30300 max_fails=3 fail_timeout=5s;"
+          - "}"
+          - ""
+          - "Oppure usa port-forward per accesso diretto:"
+          - "kubectl port-forward -n monitoring svc/prometheus-grafana 3000:80"
+          - "kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 9090:9090"
